@@ -3,7 +3,13 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { getPusherClient } from "@/lib/pusher-client";
-import type { GameState } from "@/lib/gameEngine";
+import {
+  createInitialState,
+  tick,
+  changeDirection,
+  type GameState,
+  type Direction,
+} from "@/lib/gameEngine";
 
 const CELL_SIZE = 16;
 const GRID = 30;
@@ -15,31 +21,102 @@ export default function GamePage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameStateRef = useRef<GameState | null>(null);
   const animFrameRef = useRef<number>(0);
+  const tickIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const channelRef = useRef<ReturnType<
+    ReturnType<typeof getPusherClient>["subscribe"]
+  > | null>(null);
   const [displayState, setDisplayState] = useState<GameState | null>(null);
   const [playerIndex, setPlayerIndex] = useState<number>(0);
+  const [playerName, setPlayerName] = useState<string>("");
   const foodPulseRef = useRef(0);
+  const isHostRef = useRef(false);
 
   useEffect(() => {
     const idx = parseInt(sessionStorage.getItem("playerIndex") || "0");
+    const name = sessionStorage.getItem("playerName") || "Player";
     setPlayerIndex(idx);
+    setPlayerName(name);
+    isHostRef.current = idx === 0;
+
+    // Host (Player 1) creates initial state
+    if (idx === 0) {
+      const state = createInitialState(roomId);
+      state.players[0] = name;
+      gameStateRef.current = state;
+      setDisplayState(state);
+    }
+  }, [roomId]);
+
+  const broadcastState = useCallback(() => {
+    const channel = channelRef.current;
+    const state = gameStateRef.current;
+    if (channel && state) {
+      channel.trigger("client-game-state", state);
+    }
   }, []);
 
+  const startGameLoop = useCallback(() => {
+    if (tickIntervalRef.current) return;
+    tickIntervalRef.current = setInterval(() => {
+      const state = gameStateRef.current;
+      if (!state || state.status !== "playing") {
+        if (state?.status === "finished" && tickIntervalRef.current) {
+          clearInterval(tickIntervalRef.current);
+          tickIntervalRef.current = null;
+          broadcastState();
+          setDisplayState({ ...state });
+        }
+        return;
+      }
+      tick(state);
+      setDisplayState({ ...state });
+      broadcastState();
+    }, 120);
+  }, [broadcastState]);
+
+  const startCountdown = useCallback(() => {
+    const state = gameStateRef.current;
+    if (!state) return;
+    state.status = "countdown";
+    setDisplayState({ ...state });
+    broadcastState();
+
+    setTimeout(() => {
+      const s = gameStateRef.current;
+      if (s && s.status === "countdown") {
+        s.status = "playing";
+        setDisplayState({ ...s });
+        broadcastState();
+        startGameLoop();
+      }
+    }, 3000);
+  }, [broadcastState, startGameLoop]);
+
+  // Send direction change
   const sendMove = useCallback(
     (direction: string) => {
-      fetch("/api/game", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "move",
-          roomId,
-          playerIndex: parseInt(sessionStorage.getItem("playerIndex") || "0"),
-          direction,
-        }),
-      });
+      const idx = parseInt(sessionStorage.getItem("playerIndex") || "0");
+      if (isHostRef.current) {
+        // Host applies direction locally
+        const state = gameStateRef.current;
+        if (state) {
+          changeDirection(state, idx, direction as Direction);
+        }
+      } else {
+        // Guest sends direction via Pusher client event
+        const channel = channelRef.current;
+        if (channel) {
+          channel.trigger("client-move", {
+            playerIndex: idx,
+            direction,
+          });
+        }
+      }
     },
-    [roomId]
+    []
   );
 
+  // Keyboard controls
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       const keyMap: Record<string, string> = {
@@ -66,21 +143,75 @@ export default function GamePage() {
     return () => window.removeEventListener("keydown", handleKey);
   }, [sendMove]);
 
+  // Pusher subscription
   useEffect(() => {
     const pusher = getPusherClient();
     const channel = pusher.subscribe(`private-room-${roomId}`);
+    channelRef.current = channel;
 
-    channel.bind("game-state", (state: GameState) => {
-      gameStateRef.current = state;
-      setDisplayState(state);
-    });
+    if (isHostRef.current) {
+      // Host listens for player join
+      channel.bind(
+        "player-joined",
+        (data: { playerName: string; playerIndex: number }) => {
+          const state = gameStateRef.current;
+          if (state) {
+            state.players[1] = data.playerName;
+            setDisplayState({ ...state });
+            startCountdown();
+          }
+        }
+      );
+
+      // Host listens for guest direction changes
+      channel.bind(
+        "client-move",
+        (data: { playerIndex: number; direction: string }) => {
+          const state = gameStateRef.current;
+          if (state) {
+            changeDirection(state, data.playerIndex, data.direction as Direction);
+          }
+        }
+      );
+
+      // Host listens for rematch requests
+      channel.bind("rematch-requested", () => {
+        if (tickIntervalRef.current) {
+          clearInterval(tickIntervalRef.current);
+          tickIntervalRef.current = null;
+        }
+        const oldPlayers = gameStateRef.current?.players;
+        const state = createInitialState(roomId);
+        state.players[0] = oldPlayers?.[0] || null;
+        state.players[1] = oldPlayers?.[1] || null;
+        gameStateRef.current = state;
+        setDisplayState({ ...state });
+        startCountdown();
+      });
+    } else {
+      // Guest receives game state from host
+      channel.bind("client-game-state", (state: GameState) => {
+        gameStateRef.current = state;
+        setDisplayState(state);
+      });
+
+      // Guest also listens for rematch (to reset local display)
+      channel.bind("rematch-requested", () => {
+        // Host will send new state via client-game-state
+      });
+    }
 
     return () => {
       channel.unbind_all();
       pusher.unsubscribe(`private-room-${roomId}`);
+      if (tickIntervalRef.current) {
+        clearInterval(tickIntervalRef.current);
+        tickIntervalRef.current = null;
+      }
     };
-  }, [roomId]);
+  }, [roomId, startCountdown]);
 
+  // Canvas render loop
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -162,16 +293,27 @@ export default function GamePage() {
   }, []);
 
   async function handleRematch() {
-    await fetch("/api/game", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "rematch",
-        roomId,
-        player0: displayState?.players[0],
-        player1: displayState?.players[1],
-      }),
-    });
+    if (isHostRef.current) {
+      // Host resets locally
+      if (tickIntervalRef.current) {
+        clearInterval(tickIntervalRef.current);
+        tickIntervalRef.current = null;
+      }
+      const oldPlayers = gameStateRef.current?.players;
+      const state = createInitialState(roomId);
+      state.players[0] = oldPlayers?.[0] || null;
+      state.players[1] = oldPlayers?.[1] || null;
+      gameStateRef.current = state;
+      setDisplayState({ ...state });
+      startCountdown();
+    } else {
+      // Guest asks server to notify host
+      await fetch("/api/game", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "rematch", roomId }),
+      });
+    }
   }
 
   const isWaiting = !displayState || displayState.status === "waiting";
@@ -209,9 +351,7 @@ export default function GamePage() {
 
         {isWaiting && (
           <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center rounded-lg">
-            <p className="text-white text-xl mb-2">
-              Waiting for opponent...
-            </p>
+            <p className="text-white text-xl mb-2">Waiting for opponent...</p>
             <p className="text-gray-400 text-sm">
               Share code:{" "}
               <span className="text-yellow-400 font-mono text-2xl">
@@ -243,7 +383,8 @@ export default function GamePage() {
               {resultText}
             </p>
             <p className="text-gray-400">
-              {displayState?.snakes[0].score} - {displayState?.snakes[1].score}
+              {displayState?.snakes[0].score} -{" "}
+              {displayState?.snakes[1].score}
             </p>
             <button
               onClick={handleRematch}
